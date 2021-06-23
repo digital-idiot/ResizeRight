@@ -1,10 +1,11 @@
 import warnings
 from math import ceil
-import interp_methods
+from . import interp_methods
 
 
 class NoneClass:
     pass
+
 
 try:
     import torch
@@ -13,6 +14,7 @@ try:
 except ImportError:
     warnings.warn('No PyTorch found, will work only with Numpy')
     torch = None
+    nn = None
     nnModuleWrapped = NoneClass
 
 try:
@@ -26,18 +28,18 @@ if numpy is None and torch is None:
     raise ImportError("Must have either Numpy or PyTorch but both not found")
 
 
-def resize(input, scale_factors=None, out_shape=None,
-           interp_method=interp_methods.cubic, support_sz=None, 
+def resize(src_tensor, scale_factors=None, out_shape=None,
+           interp_method=interp_methods.cubic, support_sz=None,
            antialiasing=True):
     # get properties of the input tensor
-    in_shape, n_dims = input.shape, input.ndim
+    in_shape, n_dims = src_tensor.shape, src_tensor.ndim
 
     # fw stands for framework that can be either numpy or torch,
     # determined by the input type
-    fw = numpy if type(input) is numpy.ndarray else torch
+    fw = numpy if type(src_tensor) is numpy.ndarray else torch
     eps = fw.finfo(fw.float32).eps
 
-    # set missing scale factors or output shapem one according to another,
+    # set missing scale factors or output shape, one according to another,
     # scream if both missing
     scale_factors, out_shape = set_scale_and_out_sz(in_shape, out_shape,
                                                     scale_factors, fw)
@@ -55,11 +57,12 @@ def resize(input, scale_factors=None, out_shape=None,
         support_sz = interp_method.support_sz
         
     # when using pytorch, we need to know what is the input tensor device
+    device = torch.device("cpu")  # Fallback device
     if fw is torch:
-        device = input.device
+        device = src_tensor.device
 
     # output begins identical to input and changes with each iteration
-    output = input
+    output = src_tensor
 
     # iterate over dims
     for dim, scale_factor in sorted_filtered_dims_and_scales:
@@ -67,84 +70,100 @@ def resize(input, scale_factors=None, out_shape=None,
         # get 1d set of weights and fields of view for each output location
         # along this dim
         field_of_view, weights = prepare_weights_and_field_of_view_1d(
-            dim, scale_factor, in_shape[dim], out_shape[dim], interp_method,
+            scale_factor, in_shape[dim], out_shape[dim], interp_method,
             support_sz, antialiasing, fw, eps, device)
 
         # multiply the weights by the values in the field of view and
-        # aggreagate
-        output = apply_weights(output, field_of_view, weights, dim, n_dims,
-                               fw)
+        # aggregate
+        output = apply_weights(
+            output, field_of_view, weights, dim, n_dims, fw
+        )
     return output
 
 
 class ResizeLayer(nnModuleWrapped):
     def __init__(self, in_shape, scale_factors=None, out_shape=None,
                  interp_method=interp_methods.cubic, support_sz=None,
-                 antialiasing=True):
+                 antialiasing=True, device=torch.device("cpu")):
         super(ResizeLayer, self).__init__()
 
         # fw stands for framework, that can be either numpy or torch. since
         # this is a torch layer, only one option in this case.
-        fw = torch
-        eps = fw.finfo(fw.float32).eps
+        self.fw = torch
+        self.eps = self.fw.finfo(self.fw.float32).eps
 
-        # set missing scale factors or output shapem one according to another,
+        # set missing scale factors or output shape, one according to another
         # scream if both missing
-        scale_factors, out_shape = set_scale_and_out_sz(in_shape, out_shape,
-                                                        scale_factors, fw)
-        
+        scale_factors, out_shape = set_scale_and_out_sz(
+            in_shape, out_shape, scale_factors, self.fw
+        )
+        self.in_shape = in_shape
+        self.out_shape = out_shape
+        self.scale_factors = scale_factors
+        self.interp_method = interp_method
+        self.antialiasing = antialiasing
+
         # unless support size is specified by the user, it is an attribute
         # of the interpolation method
         if support_sz is None:
             support_sz = interp_method.support_sz
-        
-        self.n_dims = len(in_shape)       
-
+        self.support_sz = support_sz
+        self.n_dims = len(in_shape)
         # sort indices of dimensions according to scale of each dimension.
         # since we are going dim by dim this is efficient
-        self.sorted_filtered_dims_and_scales = [(dim, scale_factors[dim])
-                                                for dim in
-                                                sorted(range(self.n_dims),
-                                                key=lambda ind:
-                                                scale_factors[ind])
-                                                if scale_factors[dim] != 1.]
+        self.sorted_filtered_dims_and_scales = [
+            (
+                dim, self.scale_factors[dim]
+            ) for dim in sorted(
+                range(self.n_dims),
+                key=lambda ind: self.scale_factors[ind]
+            ) if self.scale_factors[dim] != 1.
+        ]
 
         # iterate over dims
-        field_of_view_list = []
-        weights_list = []
+        field_of_view_list = list()
+        weights_list = list()
         for dim, scale_factor in self.sorted_filtered_dims_and_scales:
-
             # get 1d set of weights and fields of view for each output
             # location along this dim
             field_of_view, weights = prepare_weights_and_field_of_view_1d(
-                dim, scale_factor, in_shape[dim], out_shape[dim],
-                interp_method, support_sz, antialiasing, fw, eps, input.device)
+                scale_factor, self.in_shape[dim], self.out_shape[dim],
+                self.interp_method, self.support_sz, self.antialiasing,
+                self.fw, self.eps, device
+            )
 
             # keep weights and fields of views for all dims
             weights_list.append(nn.Parameter(weights, requires_grad=False))
             field_of_view_list.append(nn.Parameter(field_of_view,
-                                      requires_grad=False))
+                                                   requires_grad=False))
 
         self.field_of_view = nn.ParameterList(field_of_view_list)
         self.weights = nn.ParameterList(weights_list)
-        self.in_shape = in_shape
 
-    def forward(self, input):
+    def forward(self, src_tensor):
+
         # output begins identical to input and changes with each iteration
-        output = input
+        output = src_tensor
+
+        if self.field_of_view.device != src_tensor.device:
+            self.field_of_view = self.field_of_view.to(device=src_tensor.device)
+
+        if self.weights.device != src_tensor.device:
+            self.weights = self.weights.to(device=src_tensor.device)
 
         for (dim, scale_factor), field_of_view, weights in zip(
-                self.sorted_filtered_dims_and_scales,
-                self.field_of_view,
-                self.weights):
+            self.sorted_filtered_dims_and_scales,
+            self.field_of_view,
+            self.weights
+        ):
             # multiply the weights by the values in the field of view and
-            # aggreagate
+            # aggregate
             output = apply_weights(output, field_of_view, weights, dim,
                                    self.n_dims, torch)
         return output
 
 
-def prepare_weights_and_field_of_view_1d(dim, scale_factor, in_sz, out_sz,
+def prepare_weights_and_field_of_view_1d(scale_factor, in_sz, out_sz,
                                          interp_method, support_sz, 
                                          antialiasing, fw, eps, device=None):
     # If antialiasing is taking place, we modify the window size and the
@@ -171,7 +190,7 @@ def prepare_weights_and_field_of_view_1d(dim, scale_factor, in_sz, out_sz,
     return field_of_view, weights
 
 
-def apply_weights(input, field_of_view, weights, dim, n_dims, fw):
+def apply_weights(src_tensor, field_of_view, weights, dim, n_dims, fw):
     # STEP 4- APPLY WEIGHTS: Each output pixel is calculated by multiplying
     # its set of weights with the pixel values in its field of view.
     # We now multiply the fields of view with their matching weights.
@@ -181,7 +200,7 @@ def apply_weights(input, field_of_view, weights, dim, n_dims, fw):
 
     # for this operations we assume the resized dim is the first one.
     # so we transpose and will transpose back after multiplying
-    tmp_input = fw_swapaxes(input, dim, 0, fw)
+    tmp_input = fw_swapaxes(src_tensor, dim, 0, fw)
 
     # field_of_view is a tensor of order 2: for each output (1d location
     # along cur dim)- a list of 1d neighbors locations.
@@ -215,14 +234,14 @@ def set_scale_and_out_sz(in_shape, out_shape, scale_factors, fw):
         raise ValueError("either scale_factors or out_shape should be "
                          "provided")
     if out_shape is not None:
-        # if out_shape has less dims than in_shape, we defaultly resize the
+        # if out_shape has less dims than in_shape, we by default resize the
         # first dims for numpy and last dims for torch
         out_shape = (list(out_shape) + list(in_shape[:-len(out_shape)])
                      if fw is numpy
                      else list(in_shape[:-len(out_shape)]) + list(out_shape))
         if scale_factors is None:
             # if no scale given, we calculate it as the out to in ratio
-            # (not recomended)
+            # (not recommended)
             scale_factors = [out_sz / in_sz for out_sz, in_sz
                              in zip(out_shape, in_shape)]
     if scale_factors is not None:
@@ -231,7 +250,7 @@ def set_scale_and_out_sz(in_shape, out_shape, scale_factors, fw):
         scale_factors = (scale_factors
                          if isinstance(scale_factors, (list, tuple))
                          else [scale_factors, scale_factors])
-        # if less scale_factors than in_shape dims, we defaultly resize the
+        # if less scale_factors than in_shape dims, we by default resize the
         # first dims for numpy and last dims for torch
         scale_factors = (list(scale_factors) + [1] *
                          (len(in_shape) - len(scale_factors)) if fw is numpy
@@ -239,7 +258,7 @@ def set_scale_and_out_sz(in_shape, out_shape, scale_factors, fw):
                          list(scale_factors))
         if out_shape is None:
             # when no out_shape given, it is calculated by multiplying the
-            # scale by the in_shape (not recomended)
+            # scale by the in_shape (not recommended)
             out_shape = [ceil(scale_factor * in_sz)
                          for scale_factor, in_sz in
                          zip(scale_factors, in_shape)]
@@ -249,15 +268,15 @@ def set_scale_and_out_sz(in_shape, out_shape, scale_factors, fw):
 
 
 def get_projected_grid(in_sz, out_sz, scale_factor, fw, device=None):
-    # we start by having the ouput coordinates which are just integer locations
+    # we start by having the output coordinates which are just integer locations
     out_coordinates = fw.arange(out_sz)
     
     # if using torch we need to match the grid tensor device to the input device
     out_coordinates = fw_set_device(out_coordinates, device, fw)
         
-    # This is projecting the ouput pixel locations in 1d to the input tensor,
+    # This is projecting the output pixel locations in 1d to the input tensor,
     # as non-integer locations.
-    # the following fomrula is derived in the paper
+    # the following formula is derived in the paper
     # "From Discrete to Continuous Convolutions" by Shocher et al.
     return (out_coordinates / scale_factor +
             (in_sz - 1) / 2 - (out_sz - 1) / (2 * scale_factor))
@@ -281,7 +300,7 @@ def get_field_of_view(projected_grid, cur_support_sz, in_sz, fw, eps):
     # (which would require enlarging the input tensor)
     mirror = fw_cat((fw.arange(in_sz), fw.arange(in_sz - 1, -1, step=-1)), fw)
     field_of_view = mirror[fw.remainder(field_of_view, mirror.shape[0])]
-    field_of_view = fw_set_device(field_of_view,projected_grid.device, fw)
+    field_of_view = fw_set_device(field_of_view, projected_grid.device, fw)
     return field_of_view
 
 
@@ -331,7 +350,8 @@ def fw_swapaxes(x, ax_1, ax_2, fw):
         return fw.swapaxes(x, ax_1, ax_2)
     else:
         return x.transpose(ax_1, ax_2)
-    
+
+
 def fw_set_device(x, device, fw):
     if fw is numpy:
         return x
